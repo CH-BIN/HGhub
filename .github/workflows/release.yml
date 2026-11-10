@@ -1,140 +1,127 @@
-name: Release
+name: Release Android
 
-# 打 tag（v1.2.3）即自动出包并发布 Release；也可以在 Actions 页手动跑一次只出产物。
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-android-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CI: "true"
 
 jobs:
- 
-  # ================= Android：按 ABI 分包 + 签名 =================
   android:
     name: Android (split per ABI)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: 版本号对齐 tag
+      - name: 版本号提取
         id: ver
         shell: bash
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            V="${GITHUB_REF_NAME#v}"
+            V="${GITHUB_REF#refs/tags/v}"
           else
-            V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+            V="$(node -p "require('./package.json').version")"
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          node -e "const fs=require('fs');for(const p of ['src-tauri/tauri.conf.json','package.json']){const j=JSON.parse(fs.readFileSync(p));j.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')}" "$V"
 
-      - uses: pnpm/action-setup@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
         with:
-          version: 10
-      - uses: actions/setup-node@v4
+          version: latest
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
+          cache: "pnpm"
 
-      - uses: actions/setup-java@v4
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: 17
 
-      - name: 准备 Android SDK / NDK
-        run: |
-          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
-          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
-          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
-          ls "$SDK/ndk"
+      - name: 安装 Android SDK / NDK
+        uses: android-actions/setup-android@v3
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: 安装 Rust
+        uses: actions-rs/toolchain@v1
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
-          key: android
+          toolchain: stable
+          override: true
+          target: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android
 
-      - run: pnpm install --frozen-lockfile
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
 
-      - name: 生成 Android 工程
-        run: pnpm tauri android init --ci
+      - name: Tauri Android init
+        run: pnpm tauri android init
 
-      - name: 编译 APK（按 ABI 分包）
-        run: pnpm tauri android build --apk --split-per-abi --target aarch64 armv7 x86_64
+      - name: Tauri Android build
+        run: pnpm tauri android build --apk --split-per-abi
 
-      - name: 签名 APK
+      - name: 自动生成 keystore + 签名 APK
         env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: upload
+          STORE_PASSWORD: StorePass_123456
+          KEY_PASSWORD: KeyPass_123456
           VERSION: ${{ steps.ver.outputs.version }}
+        shell: bash
         run: |
           set -euo pipefail
-
           KS="$RUNNER_TEMP/release.keystore"
           BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
           APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
 
           mkdir -p artifacts
+
+          keytool -genkey -v \
+            -keystore "$KS" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -alias "$KEY_ALIAS" \
+            -storepass "$STORE_PASSWORD" \
+            -keypass "$KEY_PASSWORD" \
+            -dname "CN=Self, O=SelfDev, L=Kunming, S=Yunnan, C=CN"
+
           found=0
-
-          if [ -n "${KEYSTORE_BASE64:-}" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
-          fi
-
           while IFS= read -r f; do
-            abi="$(basename "$(dirname "$(dirname "$f")")")"
-            out="artifacts/HGhub_${VERSION}_${abi}.apk"
-
-            if [ -z "${KEYSTORE_BASE64:-}" ]; then
-              echo "::warning::未配置签名，跳过签名：$f"
-              cp "$f" "$out"
-            else
-              echo "正在签名：$f -> $out"
-              "$APKSIGNER" sign \
-                --ks "$KS" --ks-key-alias "$KEY_ALIAS" \
-                --ks-pass "pass:$STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" \
-                --v4-signing-enabled false \
-                --out "$out" "$f"
-              "$APKSIGNER" verify --print-certs "$out" | head -3
-            fi
-
+            abi_dir="$(basename "$(dirname "$f")")"
+            out="artifacts/HGhub_${VERSION}_${abi_dir}.apk"
+            echo "正在签名：$f -> $out"
+            "$APKSIGNER" sign \
+              --ks "$KS" \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass "pass:$STORE_PASSWORD" \
+              --key-pass "pass:$KEY_PASSWORD" \
+              --v4-signing-enabled false \
+              --out "$out" "$f"
+            "$APKSIGNER" verify --print-certs "$out" | head -4
             found=$((found + 1))
           done < <(find src-tauri/gen/android/app/build/outputs/apk -name '*-release*.apk')
 
-          if [ -n "${KEYSTORE_BASE64:-}" ]; then
-            rm -f "$KS"
-          fi
+          rm -f "$KS"
 
-          if [ "$found" -eq 0 ]; then
+          if [[ "$found" -eq 0 ]]; then
             echo "::error::没有找到 release APK"
             exit 1
           fi
-
           ls -lh artifacts
 
-      - uses: actions/upload-artifact@v4
+      - name: 上传 Android Artifact
+        uses: actions/upload-artifact@v4
         with:
           name: android
           path: artifacts/*
           if-no-files-found: error
 
-
-  
-  # ================= 发布 =================
   release:
     name: Publish GitHub Release
     needs: [android]
@@ -148,11 +135,8 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: 列出待发布文件
-        run: ls -lh artifacts
-
-      - uses: softprops/action-gh-release@v2
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
           generate_release_notes: true
-          fail_on_unmatched_files: true
